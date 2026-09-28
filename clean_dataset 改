@@ -1,0 +1,117 @@
+import os
+import shutil
+import numpy as np
+from PIL import Image, ImageStat
+import imagehash
+import pillow_heif
+
+# HEIC形式のデコードを有効化
+pillow_heif.register_heif_opener()
+
+# ==================== 設定エリア ====================
+# 写真が入っている元のフォルダ名
+INPUT_DIR = "iPhone"
+
+# 分類先の出力フォルダ
+OUTPUT_DIR = "dataset_classified"
+DIR_CLEAN = os.path.join(OUTPUT_DIR, "target_clean")      # ★選別された候補画像
+DIR_NOISE = os.path.join(OUTPUT_DIR, "venue_noise")       # 明るさ・色味の極端なノイズ
+DIR_BLURRED = os.path.join(OUTPUT_DIR, "blurred")         # 手ブレ・ボケ
+DIR_DUP = os.path.join(OUTPUT_DIR, "duplicates")          # 連写による重複カット
+
+# 判定しきい値
+BLUR_THRESHOLD = 15.0     # エッジ分散による手ブレ判定（小さいほどボケ判定）
+HASH_DIFF_THRESHOLD = 6   # 重複判定の類似度
+# ====================================================
+
+for d in [DIR_CLEAN, DIR_NOISE, DIR_BLURRED, DIR_DUP]:
+    os.makedirs(d, exist_ok=True)
+
+VALID_EXTS = ('.jpg', '.jpeg', '.png', '.heic')
+
+def check_blur(pil_img):
+    """Pillowのみでエッジの高周波成分から手ブレ・ボケを簡易判定"""
+    try:
+        # グレースケール変換して画素値のグラデーション差分を計算
+        gray = pil_img.convert('L')
+        arr = np.array(gray, dtype=np.float32)
+        # 簡易的なラプラシアン風の差分分散
+        diff_x = np.diff(arr, axis=1)
+        diff_y = np.diff(arr, axis=0)
+        edge_var = (np.var(diff_x) + np.var(diff_y)) / 2.0
+        return edge_var < BLUR_THRESHOLD, edge_var
+    except Exception:
+        return False, 100.0
+
+def check_light_noise(pil_img):
+    """極端な白飛び・黒潰れ（会場の天井や暗がり）を判定"""
+    try:
+        gray = pil_img.convert('L')
+        stat = ImageStat.Stat(gray)
+        mean_brightness = stat.mean[0]
+        # 平均輝度が極端に低い（真っ暗）または高すぎる（白飛び）
+        return mean_brightness < 20 or mean_brightness > 240
+    except Exception:
+        return False
+
+def main():
+    if not os.path.exists(INPUT_DIR):
+        print(f"エラー: フォルダ '{INPUT_DIR}' が見つかりません。")
+        return
+
+    files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(VALID_EXTS)]
+    files.sort()
+    total = len(files)
+    print(f"対象画像数: {total} 枚の処理を開始します...")
+
+    saved_hashes = []
+
+    for idx, fname in enumerate(files):
+        src_path = os.path.join(INPUT_DIR, fname)
+
+        try:
+            pil_img = Image.open(src_path)
+        except Exception:
+            continue
+
+        # 1. 極端な明るさノイズ判定
+        if check_light_noise(pil_img):
+            shutil.copy2(src_path, os.path.join(DIR_NOISE, fname))
+            continue
+
+        # 2. 手ブレ判定
+        blurred, _ = check_blur(pil_img)
+        if blurred:
+            shutil.copy2(src_path, os.path.join(DIR_BLURRED, fname))
+            continue
+
+        # 3. 連写重複判定（pHash）
+        try:
+            curr_hash = imagehash.phash(pil_img)
+            is_dup = False
+            for prev_hash in saved_hashes[-5:]:
+                if curr_hash - prev_hash < HASH_DIFF_THRESHOLD:
+                    is_dup = True
+                    break
+
+            if is_dup:
+                shutil.copy2(src_path, os.path.join(DIR_DUP, fname))
+                continue
+
+            shutil.copy2(src_path, os.path.join(DIR_CLEAN, fname))
+            saved_hashes.append(curr_hash)
+
+        except Exception:
+            continue
+
+        if (idx + 1) % 100 == 0 or (idx + 1) == total:
+            print(f"進捗: {idx + 1} / {total} 完了")
+
+    print("\n【分類処理が完了しました】")
+    print(f"- target_clean (★選別された候補): {len(os.listdir(DIR_CLEAN))} 枚")
+    print(f"- venue_noise  (暗所・白飛びノイズ): {len(os.listdir(DIR_NOISE))} 枚")
+    print(f"- blurred      (手ブレ・ボケ):     {len(os.listdir(DIR_BLURRED))} 枚")
+    print(f"- duplicates   (連写重複):         {len(os.listdir(DIR_DUP))} 枚")
+
+if __name__ == "__main__":
+    main()
